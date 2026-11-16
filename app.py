@@ -1,23 +1,21 @@
 import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, WebRtcMode
-import av
+import streamlit.components.v1 as components
 import cv2
 import numpy as np
 import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import pandas as pd
-import time
 import matplotlib.pyplot as plt
-import threading
+import base64
+import tempfile
+import json
 
-# ページ設定
-st.set_page_config(page_title="眼球運動（追従運動）チェックアプリ", layout="centered")
+st.set_page_config(page_title="眼球運動チェックアプリ", layout="centered")
 st.title("👁️ 眼球運動（追従運動）テスト")
-st.write("カメラを使って、動く的（赤い丸）を目だけで追えているかを計測・分析します。")
 
-# MediaPipeモデルを作成する関数（別スレッドでも安全に動くように変更）
-def create_detector():
+@st.cache_resource
+def load_detector():
     base_options = python.BaseOptions(model_asset_path="face_landmarker.task")
     options = vision.FaceLandmarkerOptions(
         base_options=base_options,
@@ -27,234 +25,177 @@ def create_detector():
     )
     return vision.FaceLandmarker.create_from_options(options)
 
-# 映像処理クラスの定義
-class EyeTrackingProcessor(VideoProcessorBase):
-    def __init__(self):
-        self.detector = create_detector()
-        self.lock = threading.Lock()
-        self.phase = "waiting"  # waiting -> calibrating -> testing -> done
-        self.start_time = None
-        self.calibration_duration = 3.0
-        self.test_duration = 15.0
-        self.calibration_logs = []
-        self.data_logs = []
+detector = load_detector()
 
-    def reset(self):
-        with self.lock:
-            self.phase = "waiting"
-            self.start_time = None
-            self.calibration_logs = []
-            self.data_logs = []
+def analyze_frame(frame_bgr, target_x, elapsed_time):
+    h, w, _ = frame_bgr.shape
+    rgb_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+    results = detector.detect(mp_image)
 
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        img = frame.to_ndarray(format="bgr24")
-        # 鏡のように左右反転
-        img = cv2.flip(img, 1)
-        h, w, _ = img.shape
+    normalized_eye_x = np.nan
+    nose_x = np.nan
 
-        # MediaPipeで顔・虹彩を検出
-        rgb_frame = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-        results = self.detector.detect(mp_image)
+    if results.face_landmarks and len(results.face_landmarks) > 0:
+        lm = results.face_landmarks[0]
+        nose_x = lm[1].x * w
+        face_width = abs(lm[454].x * w - lm[234].x * w)
+        left_iris_x = np.mean([lm[i].x * w for i in range(468, 473)])
+        right_iris_x = np.mean([lm[i].x * w for i in range(473, 478)])
+        if face_width > 0:
+            normalized_eye_x = (((left_iris_x + right_iris_x) / 2.0) - nose_x) / face_width
 
-        normalized_eye_x = None
-        face_in_guide = False
-        nose_x = None
+    return {'Time': elapsed_time, 'Target_X': target_x, 'Norm_Eye': normalized_eye_x, 'Head_X': nose_x, 'Width': w}
 
-        if results.face_landmarks and len(results.face_landmarks) > 0:
-            # 1人目の顔のランドマーク一覧（478個の点）を取得
-            lm = results.face_landmarks
+def show_analysis(df, calib_mean):
+    screen_w = df['Width'].iloc[0]
+    center_x = screen_w / 2.0
+    df['Norm_Eye'] = df['Norm_Eye'].interpolate(method='linear').bfill().ffill()
+    df['Head_X'] = df['Head_X'].interpolate(method='linear').bfill().ffill()
 
-            # 鼻の頭（インデックス1番）の座標
-            nose_x = lm.x * w
-            nose_y = lm.y * h
+    if np.isnan(calib_mean):
+        calib_mean = df['Norm_Eye'].iloc[:5].mean()
 
-            # 顔の左端（234番）と右端（454番）から顔の幅を計算
-            face_left_x = lm.x * w
-            face_right_x = lm.x * w
-            face_width = abs(face_right_x - face_left_x)
+    df['Eye_X_Scaled_Raw'] = center_x + ((df['Norm_Eye'] - calib_mean) * (screen_w * 5.5))
 
-            # ガイド枠内に顔があるか判定（640x480基準の比率で計算）
-            if (w * 0.4 <= nose_x <= w * 0.6) and (h * 0.33 <= nose_y <= h * 0.63) and (face_width > w * 0.12):
-                face_in_guide = True
+    best_shift, best_corr = 0, -1
+    for s in range(0, min(20, len(df) // 3)):
+        shifted = df['Eye_X_Scaled_Raw'].shift(-s).ffill().bfill()
+        if shifted.std() > 0 and df['Target_X'].std() > 0:
+            corr = df['Target_X'].corr(shifted)
+            if corr > best_corr:
+                best_corr, best_shift = corr, s
 
-            # 左右の虹彩（黒目：468〜472番と473〜477番）のX座標平均
-            left_iris_x = np.mean([lm[i].x * w for i in range(468, 473)])
-            right_iris_x = np.mean([lm[i].x * w for i in range(473, 478)])
-            avg_eye_x = (left_iris_x + right_iris_x) / 2.0
+    df['Eye_X_Scaled'] = df['Eye_X_Scaled_Raw'].shift(-best_shift).ffill().bfill()
+    head_movement = df['Head_X'].std()
+    sync_score = max(0, best_corr * 100)
 
-            if face_width > 0:
-                normalized_eye_x = (avg_eye_x - nose_x) / face_width
+    st.subheader("📈 分析結果")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("的とのシンクロ率", f"{sync_score:.1f} %")
+    c2.metric("顔の横ブレ量", f"{head_movement:.1f} px")
+    c3.metric("解析フレーム数", f"{len(df)} 枚")
 
-        with self.lock:
-            target_x, target_y = int(w / 2), int(h / 2)
+    if head_movement > 15:
+        st.warning("⚠️ 顔が左右に動いています。顎を固定して目だけで追うと正確に測れます。")
+    if sync_score > 65:
+        st.success("✅ **診断示唆**: 的の動きに合わせて綺麗に目が動いています（正常な追従運動）。")
+    else:
+        st.info("ℹ️ **診断示唆**: 連動性がやや低いです。顔を動かさず目だけで追うよう意識してください。")
 
-            if self.phase == "waiting":
-                # ガイド枠の描画
-                color = (255, 255, 0) if face_in_guide else (0, 255, 0)
-                cv2.rectangle(img, (int(w * 0.34), int(h * 0.2)), (int(w * 0.66), int(h * 0.75)), color, 3)
-                msg = "OK! Starting..." if face_in_guide else "Align face in box"
-                cv2.putText(img, msg, (int(w * 0.32), 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(df['Time'], df['Target_X'], label='Target (Red Ball)', color='red', linewidth=2)
+    ax.plot(df['Time'], df['Eye_X_Scaled'], label='Your Eye Position', color='green', linestyle='--')
+    ax.set_ylim(0, screen_w)
+    ax.legend()
+    ax.grid(True)
+    st.pyplot(fig)
 
-                if face_in_guide and normalized_eye_x is not None:
-                    self.phase = "calibrating"
-                    self.start_time = time.time()
+    csv = df.to_csv(index=False).encode('utf-8-sig')
+    st.download_button("📥 計測データをCSVでダウンロード", data=csv, file_name='eye_result.csv', mime='text/csv')
+tab1, tab2 = st.tabs(["🎥 リアルタイムWebカメラテスト", "📁 録画動画でテスト"])
 
-            elif self.phase == "calibrating":
-                elapsed = time.time() - self.start_time
-                if normalized_eye_x is not None:
-                    self.calibration_logs.append(normalized_eye_x)
+with tab1:
+    st.write("1. 「テスト開始」を押してカメラを許可 → 2. 黄色い丸(3秒)→赤い丸(12秒)を目だけで追う → 3. 完了後にデータをコピーして下に貼り付け")
+    html_code = """
+    <div style="text-align:center; font-family:sans-serif;">
+        <button id="startBtn" style="padding:10px 20px; font-size:15px; background:#ff4b4b; color:white; border:none; border-radius:6px; cursor:pointer;">▶ テスト開始（カメラ起動）</button>
+        <div id="statusText" style="font-weight:bold; margin:8px 0;">ボタンを押して開始</div>
+        <div style="position:relative; width:480px; height:360px; margin:0 auto; background:#000;">
+            <video id="video" width="480" height="360" autoplay playsinline style="transform:scaleX(-1);"></video>
+            <canvas id="overlay" width="480" height="360" style="position:absolute; top:0; left:0;"></canvas>
+        </div>
+        <div id="resultBox" style="display:none; margin-top:10px;">
+            <button id="copyBtn" style="padding:8px 16px; background:#0068c9; color:white; border:none; border-radius:4px; cursor:pointer;">📋 計測データをコピー</button>
+            <textarea id="outputData" rows="2" style="width:90%; margin-top:5px;"></textarea>
+        </div>
+    </div>
+    <script>
+    const startBtn = document.getElementById('startBtn'), video = document.getElementById('video'), overlay = document.getElementById('overlay'), ctx = overlay.getContext('2d');
+    const statusText = document.getElementById('statusText'), resultBox = document.getElementById('resultBox'), outputData = document.getElementById('outputData'), copyBtn = document.getElementById('copyBtn');
+    const cap = document.createElement('canvas'); cap.width = 320; cap.height = 240; const capCtx = cap.getContext('2d');
 
-                # 黄色い丸を描画
-                cv2.circle(img, (target_x, target_y), 15, (0, 255, 255), -1)
-                cv2.circle(img, (target_x, target_y), 15, (255, 255, 255), 2)
-                cv2.putText(img, "Look at YELLOW dot (3s)", (int(w * 0.25), 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+    startBtn.onclick = async () => {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 480, height: 360 }, audio: false });
+            video.srcObject = stream; startBtn.disabled = true; resultBox.style.display = 'none';
+            const records = [], startTime = performance.now(); let lastCap = 0;
+            function loop(now) {
+                const elapsed = (now - startTime) / 1000.0;
+                ctx.clearRect(0, 0, 480, 360);
+                if (elapsed < 3.0) {
+                    statusText.innerText = `【基準測定】黄色い丸を見てください (${(3.0 - elapsed).toFixed(1)}秒)`;
+                    ctx.beginPath(); ctx.arc(240, 180, 14, 0, Math.PI * 2); ctx.fillStyle = 'yellow'; ctx.fill();
+                    if (now - lastCap > 150) {
+                        lastCap = now; capCtx.save(); capCtx.scale(-1, 1); capCtx.drawImage(video, -320, 0, 320, 240); capCtx.restore();
+                        records.push({ phase: 'calib', t: elapsed, tx: 160, img: cap.toDataURL('image/jpeg', 0.6) });
+                    }
+                    requestAnimationFrame(loop);
+                } else if (elapsed < 15.0) {
+                    const t = elapsed - 3.0;
+                    statusText.innerText = `【本番】赤い丸を目だけで追ってください (${(15.0 - elapsed).toFixed(1)}秒)`;
+                    const tx480 = 240 + 160 * Math.sin(2 * Math.PI * 0.12 * t);
+                    const tx320 = 160 + 106 * Math.sin(2 * Math.PI * 0.12 * t);
+                    ctx.beginPath(); ctx.arc(tx480, 180, 14, 0, Math.PI * 2); ctx.fillStyle = 'red'; ctx.fill();
+                    if (now - lastCap > 120) {
+                        lastCap = now; capCtx.save(); capCtx.scale(-1, 1); capCtx.drawImage(video, -320, 0, 320, 240); capCtx.restore();
+                        records.push({ phase: 'test', t: t, tx: tx320, img: cap.toDataURL('image/jpeg', 0.6) });
+                    }
+                    requestAnimationFrame(loop);
+                } else {
+                    stream.getTracks().forEach(tr => tr.stop());
+                    statusText.innerText = "完了！下の「計測データをコピー」を押してください。";
+                    outputData.value = JSON.stringify(records); resultBox.style.display = 'block'; startBtn.disabled = false;
+                }
+            }
+            requestAnimationFrame(loop);
+        } catch (e) { statusText.innerText = "エラー: " + e.message; }
+    };
+    copyBtn.onclick = () => { outputData.select(); document.execCommand('copy'); copyBtn.innerText = "✅ コピー完了！"; };
+    </script>
+    """
+    components.html(html_code, height=500)
 
-                if elapsed > self.calibration_duration:
-                    if len(self.calibration_logs) > 5:
-                        self.phase = "testing"
-                        self.start_time = time.time()
-                    else:
-                        self.phase = "waiting"
-                        self.calibration_logs = []
-
-            elif self.phase == "testing":
-                elapsed = time.time() - self.start_time
-                if elapsed > self.test_duration:
-                    self.phase = "done"
-                else:
-                    # 的の座標を計算（左右に往復）
-                    amplitude = w * 0.31
-                    target_x = int((w / 2) + amplitude * np.sin(2 * np.pi * 0.05 * elapsed))
-
-                    # 赤い丸を描画
-                    cv2.circle(img, (target_x, target_y), 15, (0, 0, 255), -1)
-                    cv2.circle(img, (target_x, target_y), 15, (255, 255, 255), 2)
-                    cv2.putText(img, f"Follow RED dot: {int(self.test_duration - elapsed)}s", (int(w * 0.25), 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-
-                    self.data_logs.append({
-                        'Time': elapsed,
-                        'Target_X': target_x,
-                        'Norm_Eye': normalized_eye_x if normalized_eye_x is not None else np.nan,
-                        'Head_X': nose_x if nose_x is not None else np.nan,
-                        'Width': w
-                    })
-
-            elif self.phase == "done":
-                cv2.putText(img, "Test Complete! Click 'Show Results' below.", (int(w * 0.12), int(h / 2)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-
-        return av.VideoFrame.from_ndarray(img, format="bgr24")
-
-# 説明書き
-with st.expander("📋 テストの手順（クリックして開く）", expanded=True):
-    st.markdown("""
-    1. 下の **「START」** ボタンを押してカメラを起動します。
-    2. 画面の **緑色の枠** に顔を合わせると自動でテストが始まります。
-    3. 最初に **3秒間、真ん中の黄色い丸** をじっと見つめてください。
-    4. 続いて **15秒間、左右に動く赤い丸** を **顔は動かさず目だけで** 追ってください。
-    5. 完了したら、下の **「計測結果を分析・表示する」** ボタンを押してください。
-    """)
-
-# WebRTCカメラコンポーネントの起動
-ctx = webrtc_streamer(
-    key="eye-tracking",
-    mode=WebRtcMode.SENDRECV,
-    video_processor_factory=EyeTrackingProcessor,
-    media_stream_constraints={"video": True, "audio": False},
-    async_processing=True,
-    rtc_configuration={
-        "iceServers": [
-            {"urls": ["stun:://google.com"]},
-            {"urls": ["stun:://google.com"]},
-            {"urls": ["stun:://google.com"]},
-        ]
-    }
-)
-
-
-# 操作ボタンと結果表示
-col1, col2 = st.columns(2)
-with col1:
-    analyze_btn = st.button("📊 計測結果を分析・表示する", type="primary")
-with col2:
-    if st.button("🔄 テストをリセット"):
-        if ctx.video_processor:
-            ctx.video_processor.reset()
-            st.info("リセットしました。もう一度枠に顔を合わせてください。")
-
-if analyze_btn:
-    if ctx.video_processor:
-        with ctx.video_processor.lock:
-            data_logs = list(ctx.video_processor.data_logs)
-            calibration_logs = list(ctx.video_processor.calibration_logs)
-            phase = ctx.video_processor.phase
-
-        if len(data_logs) > 10 and len(calibration_logs) > 0:
-            df = pd.DataFrame(data_logs)
-            screen_w = df['Width'].iloc
-            center_x = screen_w / 2.0
-
-            df['Norm_Eye'] = df['Norm_Eye'].interpolate(method='linear').bfill().ffill()
-            df['Head_X'] = df['Head_X'].interpolate(method='linear').bfill().ffill()
-
-            center_reference = np.mean(calibration_logs)
-            df['Eye_Diff'] = df['Norm_Eye'] - center_reference
-
-            # 左右反転しているため符号を調整
-            df['Eye_X_Scaled_Raw'] = center_x + (df['Eye_Diff'] * (screen_w * 5.5))
-
-            # タイムラグ自動補正
-            best_shift = 0
-            best_corr = -1
-            max_shift = min(30, len(df) // 3)
-            for s in range(0, max_shift):
-                shifted_eye = df['Eye_X_Scaled_Raw'].shift(-s).ffill().bfill()
-                if shifted_eye.std() > 0 and df['Target_X'].std() > 0:
-                    corr = df['Target_X'].corr(shifted_eye)
-                    if corr > best_corr:
-                        best_corr = corr
-                        best_shift = s
-
-            df['Eye_X_Scaled'] = df['Eye_X_Scaled_Raw'].shift(-best_shift).ffill().bfill()
-
-            head_movement = df['Head_X'].std()
-            avg_frame_rate = len(df) / 15.0
-            lag_seconds = best_shift / avg_frame_rate if avg_frame_rate > 0 else 0
-            sync_score = max(0, best_corr * 100)
-
-            st.subheader("📈 分析結果")
-            m1, m2, m3 = st.columns(3)
-            m1.metric("的とのシンクロ率", f"{sync_score:.1f} %")
-            m2.metric("顔の横ブレ量", f"{head_movement:.1f} px", delta="10以下が理想", delta_color="off")
-            m3.metric("処理速度", f"{avg_frame_rate:.1f} fps")
-
-            if head_movement > 15:
-                st.warning("⚠️ テスト中に顔（頭）が左右に動いています。顎を固定して目だけで追うとさらに正確に測れます。")
-
-            if sync_score > 65:
-                st.success("✅ **診断示唆**: 的の動きに合わせて綺麗に目が動いています（正常な追従運動）。")
+    raw_json = st.text_area("📋 コピーした計測データをここに貼り付けてください", height=80)
+    if st.button("📊 AIで黒目の動きを解析する", type="primary") and raw_json.strip():
+        try:
+            records = json.loads(raw_json)
+            calib_vals, test_logs = [], []
+            with st.spinner("MediaPipeで解析中..."):
+                for r in records:
+                    img_bytes = base64.b64decode(r['img'].split(",", 1)[1])
+                    frame = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
+                    res = analyze_frame(frame, r['tx'], r['t'])
+                    if r['phase'] == 'calib' and not np.isnan(res['Norm_Eye']):
+                        calib_vals.append(res['Norm_Eye'])
+                    elif r['phase'] == 'test':
+                        test_logs.append(res)
+            if len(test_logs) > 5:
+                show_analysis(pd.DataFrame(test_logs), np.mean(calib_vals) if calib_vals else np.nan)
             else:
-                st.info("ℹ️ **診断示唆**: 連動性がやや低いです。顔を動かさず、目だけで追うように意識して再試行してください。")
+                st.error("解析データ不足です。もう一度お試しください。")
+        except Exception as e:
+            st.error(f"読み込みエラー: {e}")
 
-            # グラフの描画
-            fig, ax = plt.subplots(figsize=(10, 4))
-            ax.plot(df['Time'], df['Target_X'], label='Target (Red Ball)', color='red', linewidth=2)
-            ax.plot(df['Time'], df['Eye_X_Scaled'], label='Your Eye Position', color='green', alpha=0.8, linestyle='--')
-            ax.set_title('Eye Tracking Result (Normalized & Both Eyes)')
-            ax.set_xlabel('Time (seconds)')
-            ax.set_ylabel('X Position on Screen')
-            ax.set_ylim(0, screen_w)
-            ax.legend()
-            ax.grid(True)
-            st.pyplot(fig)
-
-                        # CSVダウンロードボタン
-            csv = df.to_csv(index=False).encode('utf-8-sig')
-            st.download_button(
-                label="📥 計測データをCSVでダウンロード",
-                data=csv,
-                file_name='eye_tracking_result.csv',
-                mime='text/csv',
-            )
+with tab2:
+    uploaded = st.file_uploader("動画ファイル（MP4/MOV）をアップロード", type=["mp4", "mov", "avi"])
+    if uploaded is not None:
+        tfile = tempfile.NamedTemporaryFile(delete=False)
+        tfile.write(uploaded.read())
+        cap = cv2.VideoCapture(tfile.name)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        logs, idx = [], 0
+        with st.spinner("動画を解析中..."):
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret: break
+                if idx % 3 == 0:
+                    t = idx / fps
+                    w = frame.shape[1]
+                    logs.append(analyze_frame(frame, (w / 2.0) + (w * 0.31) * np.sin(2 * np.pi * 0.1 * t), t))
+                idx += 1
+        cap.release()
+        if len(logs) > 5:
+            show_analysis(pd.DataFrame(logs), np.nan)
         else:
-            st.error("有効な計測データがまだありません。上のカメラを起動し、テストを完了させてからボタンを押してください。")
+            st.error("顔を検出できませんでした。")
