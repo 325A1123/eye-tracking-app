@@ -10,24 +10,16 @@ import matplotlib.pyplot as plt
 import base64
 import tempfile
 import json
-import os
 import urllib.request
 
 st.set_page_config(page_title="眼球運動チェックアプリ", layout="centered")
 st.title("👁️ 眼球運動（追従運動）テスト")
 
+# MediaPipeモデルの読み込み（キャッシュ化して高速化）
 @st.cache_resource
 def load_detector():
-    model_path = "face_landmarker.task"
-    if not os.path.exists(model_path):
-        url = "https://googleapis.com"
-        urllib.request.urlretrieve(url, model_path)
-    with open(model_path, "rb") as f:
-        model_data = f.read()
-    base_options = python.BaseOptions(
-        model_asset_buffer=model_data,
-        delegate=python.BaseOptions.Delegate.CPU
-    )
+    model_path = os.path.join(os.path.dirname(__file__), "face_landmarker.task")
+    base_options = python.BaseOptions(model_asset_path=model_path)
     options = vision.FaceLandmarkerOptions(
         base_options=base_options,
         output_face_blendshapes=False,
@@ -35,9 +27,11 @@ def load_detector():
         num_faces=1
     )
     return vision.FaceLandmarker.create_from_options(options)
-
+        output_face_blendshapes=False,
+        output_facial_transformation_matrixes=False,
+        num_faces=1
+   
 detector = load_detector()
-
 
 def analyze_frame(frame_bgr, target_x, elapsed_time):
     h, w, _ = frame_bgr.shape
