@@ -1,4 +1,5 @@
 import os
+import urllib.request
 import streamlit as st
 import streamlit.components.v1 as components
 import cv2
@@ -15,11 +16,26 @@ import json
 st.set_page_config(page_title="眼球運動チェックアプリ", layout="centered")
 st.title("👁️ 眼球運動（追従運動）テスト")
 
-# MediaPipeモデルの読み込み（キャッシュ化して高速化）
+# MediaPipeモデルの読み込み（CPU明示＋自動フォールバック付き）
 @st.cache_resource
 def load_detector():
     model_path = os.path.join(os.path.dirname(__file__), "face_landmarker.task")
-    base_options = python.BaseOptions(model_asset_path=model_path)
+    model_url = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+
+    if not os.path.exists(model_path) or os.path.getsize(model_path) < 1_000_000:
+        model_path = os.path.join(tempfile.gettempdir(), "face_landmarker.task")
+        if not os.path.exists(model_path) or os.path.getsize(model_path) < 1_000_000:
+            req = urllib.request.Request(model_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req) as resp, open(model_path, "wb") as f:
+                f.write(resp.read())
+
+    with open(model_path, "rb") as f:
+        model_bytes = f.read()
+
+    base_options = python.BaseOptions(
+        model_asset_buffer=model_bytes,
+        delegate=python.BaseOptions.Delegate.CPU
+    )
     options = vision.FaceLandmarkerOptions(
         base_options=base_options,
         output_face_blendshapes=False,
