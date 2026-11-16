@@ -155,15 +155,22 @@ with st.expander("📋 テストの手順（クリックして開く）", expand
     5. 完了したら、下の **「計測結果を分析・表示する」** ボタンを押してください。
     """)
 
-# WebRTCカメラコンポーネントの起動（STUNサーバー設定を修正）
+# WebRTCカメラコンポーネントの起動
 ctx = webrtc_streamer(
     key="eye-tracking",
     mode=WebRtcMode.SENDRECV,
     video_processor_factory=EyeTrackingProcessor,
     media_stream_constraints={"video": True, "audio": False},
     async_processing=True,
-    rtc_configuration={"iceServers": [{"urls": ["stun:://google.com"]}]}
+    rtc_configuration={
+        "iceServers": [
+            {"urls": ["stun:://google.com"]},
+            {"urls": ["stun:://google.com"]},
+            {"urls": ["stun:://google.com"]},
+        ]
+    }
 )
+
 
 # 操作ボタンと結果表示
 col1, col2 = st.columns(2)
