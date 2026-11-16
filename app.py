@@ -159,8 +159,10 @@ ctx = webrtc_streamer(
     video_processor_factory=EyeTrackingProcessor,
     media_stream_constraints={"video": True, "audio": False},
     async_processing=True,
-    rtc_configuration={"iceServers": [{"urls": ["stun:://google.com"]}]}
+    rtc_configuration={"iceServers": [{"urls": "stun:://google.com"}]}
 )
+
+
 
 # 操作ボタンと結果表示
 col1, col2 = st.columns(2)
