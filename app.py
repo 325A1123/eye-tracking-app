@@ -16,7 +16,12 @@ st.title("👁️ 眼球運動（追従運動）テスト")
 
 @st.cache_resource
 def load_detector():
-    base_options = python.BaseOptions(model_asset_path="face_landmarker.task")
+    with open("face_landmarker.task", "rb") as f:
+        model_data = f.read()
+    base_options = python.BaseOptions(
+        model_asset_buffer=model_data,
+        delegate=python.BaseOptions.Delegate.CPU
+    )
     options = vision.FaceLandmarkerOptions(
         base_options=base_options,
         output_face_blendshapes=False,
@@ -26,6 +31,7 @@ def load_detector():
     return vision.FaceLandmarker.create_from_options(options)
 
 detector = load_detector()
+
 
 def analyze_frame(frame_bgr, target_x, elapsed_time):
     h, w, _ = frame_bgr.shape
