@@ -241,7 +241,7 @@ if analyze_btn:
             ax.grid(True)
             st.pyplot(fig)
 
-            # CSVダウンロードボタン
+                        # CSVダウンロードボタン
             csv = df.to_csv(index=False).encode('utf-8-sig')
             st.download_button(
                 label="📥 計測データをCSVでダウンロード",
@@ -249,6 +249,5 @@ if analyze_btn:
                 file_name='eye_tracking_result.csv',
                 mime='text/csv',
             )
-             else:
-         st.error("有効な計測データがまだありません。上のカメラを起動し、テストを完了させてからボタンを押してください。")
-
+        else:
+            st.error("有効な計測データがまだありません。上のカメラを起動し、テストを完了させてからボタンを押してください。")
