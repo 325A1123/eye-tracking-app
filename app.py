@@ -10,13 +10,19 @@ import matplotlib.pyplot as plt
 import base64
 import tempfile
 import json
+import os
+import urllib.request
 
 st.set_page_config(page_title="眼球運動チェックアプリ", layout="centered")
 st.title("👁️ 眼球運動（追従運動）テスト")
 
 @st.cache_resource
 def load_detector():
-    with open("face_landmarker.task", "rb") as f:
+    model_path = "face_landmarker.task"
+    if not os.path.exists(model_path):
+        url = "https://googleapis.com"
+        urllib.request.urlretrieve(url, model_path)
+    with open(model_path, "rb") as f:
         model_data = f.read()
     base_options = python.BaseOptions(
         model_asset_buffer=model_data,
