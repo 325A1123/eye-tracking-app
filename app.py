@@ -16,9 +16,8 @@ st.set_page_config(page_title="眼球運動（追従運動）チェックアプ�
 st.title("👁️ 眼球運動（追従運動）テスト")
 st.write("カメラを使って、動く的（赤い丸）を目だけで追えているかを計測・分析します。")
 
-# MediaPipeモデルの読み込み（キャッシュ化して高速化）
-@st.cache_resource
-def load_detector():
+# MediaPipeモデルを作成する関数（別スレッドでも安全に動くように変更）
+def create_detector():
     base_options = python.BaseOptions(model_asset_path="face_landmarker.task")
     options = vision.FaceLandmarkerOptions(
         base_options=base_options,
@@ -31,7 +30,7 @@ def load_detector():
 # 映像処理クラスの定義
 class EyeTrackingProcessor(VideoProcessorBase):
     def __init__(self):
-        self.detector = load_detector()
+        self.detector = create_detector()
         self.lock = threading.Lock()
         self.phase = "waiting"  # waiting -> calibrating -> testing -> done
         self.start_time = None
@@ -63,19 +62,23 @@ class EyeTrackingProcessor(VideoProcessorBase):
         nose_x = None
 
         if results.face_landmarks and len(results.face_landmarks) > 0:
-            lm = results.face_landmarks[0]
-            nose_x = lm[1].x * w
-            nose_y = lm[1].y * h
+            # 1人目の顔のランドマーク一覧（478個の点）を取得
+            lm = results.face_landmarks
 
-            face_left_x = lm[234].x * w
-            face_right_x = lm[454].x * w
+            # 鼻の頭（インデックス1番）の座標
+            nose_x = lm.x * w
+            nose_y = lm.y * h
+
+            # 顔の左端（234番）と右端（454番）から顔の幅を計算
+            face_left_x = lm.x * w
+            face_right_x = lm.x * w
             face_width = abs(face_right_x - face_left_x)
 
             # ガイド枠内に顔があるか判定（640x480基準の比率で計算）
             if (w * 0.4 <= nose_x <= w * 0.6) and (h * 0.33 <= nose_y <= h * 0.63) and (face_width > w * 0.12):
                 face_in_guide = True
 
-            # 左右の虹彩（468-472, 473-477）のX座標平均
+            # 左右の虹彩（黒目：468〜472番と473〜477番）のX座標平均
             left_iris_x = np.mean([lm[i].x * w for i in range(468, 473)])
             right_iris_x = np.mean([lm[i].x * w for i in range(473, 478)])
             avg_eye_x = (left_iris_x + right_iris_x) / 2.0
@@ -89,9 +92,9 @@ class EyeTrackingProcessor(VideoProcessorBase):
             if self.phase == "waiting":
                 # ガイド枠の描画
                 color = (255, 255, 0) if face_in_guide else (0, 255, 0)
-                cv2.rectangle(img, (int(w*0.34), int(h*0.2)), (int(w*0.66), int(h*0.75)), color, 3)
+                cv2.rectangle(img, (int(w * 0.34), int(h * 0.2)), (int(w * 0.66), int(h * 0.75)), color, 3)
                 msg = "OK! Starting..." if face_in_guide else "Align face in box"
-                cv2.putText(img, msg, (int(w*0.32), 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+                cv2.putText(img, msg, (int(w * 0.32), 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
                 if face_in_guide and normalized_eye_x is not None:
                     self.phase = "calibrating"
@@ -105,7 +108,7 @@ class EyeTrackingProcessor(VideoProcessorBase):
                 # 黄色い丸を描画
                 cv2.circle(img, (target_x, target_y), 15, (0, 255, 255), -1)
                 cv2.circle(img, (target_x, target_y), 15, (255, 255, 255), 2)
-                cv2.putText(img, "Look at YELLOW dot (3s)", (int(w*0.25), 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                cv2.putText(img, "Look at YELLOW dot (3s)", (int(w * 0.25), 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
                 if elapsed > self.calibration_duration:
                     if len(self.calibration_logs) > 5:
@@ -123,11 +126,11 @@ class EyeTrackingProcessor(VideoProcessorBase):
                     # 的の座標を計算（左右に往復）
                     amplitude = w * 0.31
                     target_x = int((w / 2) + amplitude * np.sin(2 * np.pi * 0.05 * elapsed))
-                    
+
                     # 赤い丸を描画
                     cv2.circle(img, (target_x, target_y), 15, (0, 0, 255), -1)
                     cv2.circle(img, (target_x, target_y), 15, (255, 255, 255), 2)
-                    cv2.putText(img, f"Follow RED dot: {int(self.test_duration - elapsed)}s", (int(w*0.25), 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+                    cv2.putText(img, f"Follow RED dot: {int(self.test_duration - elapsed)}s", (int(w * 0.25), 40), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
                     self.data_logs.append({
                         'Time': elapsed,
@@ -138,7 +141,7 @@ class EyeTrackingProcessor(VideoProcessorBase):
                     })
 
             elif self.phase == "done":
-                cv2.putText(img, "Test Complete! Click 'Show Results' below.", (int(w*0.12), int(h/2)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(img, "Test Complete! Click 'Show Results' below.", (int(w * 0.12), int(h / 2)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
 
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
@@ -152,16 +155,15 @@ with st.expander("📋 テストの手順（クリックして開く）", expand
     5. 完了したら、下の **「計測結果を分析・表示する」** ボタンを押してください。
     """)
 
-# WebRTCカメラコンポーネントの起動
+# WebRTCカメラコンポーネントの起動（STUNサーバー設定を修正）
 ctx = webrtc_streamer(
     key="eye-tracking",
     mode=WebRtcMode.SENDRECV,
     video_processor_factory=EyeTrackingProcessor,
     media_stream_constraints={"video": True, "audio": False},
     async_processing=True,
+    rtc_configuration={"iceServers": [{"urls": ["stun:://google.com"]}]}
 )
-
-
 
 # 操作ボタンと結果表示
 col1, col2 = st.columns(2)
@@ -182,7 +184,7 @@ if analyze_btn:
 
         if len(data_logs) > 10 and len(calibration_logs) > 0:
             df = pd.DataFrame(data_logs)
-            screen_w = df['Width'].iloc[0]
+            screen_w = df['Width'].iloc
             center_x = screen_w / 2.0
 
             df['Norm_Eye'] = df['Norm_Eye'].interpolate(method='linear').bfill().ffill()
@@ -190,7 +192,7 @@ if analyze_btn:
 
             center_reference = np.mean(calibration_logs)
             df['Eye_Diff'] = df['Norm_Eye'] - center_reference
-            
+
             # 左右反転しているため符号を調整
             df['Eye_X_Scaled_Raw'] = center_x + (df['Eye_Diff'] * (screen_w * 5.5))
 
@@ -248,4 +250,3 @@ if analyze_btn:
                 mime='text/csv',
             )
         else:
-            st.error("有効な計測データがまだありません。上のカメラを起動し、テストを完了させてからボタンを押してください。")
