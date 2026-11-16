@@ -249,4 +249,6 @@ if analyze_btn:
                 file_name='eye_tracking_result.csv',
                 mime='text/csv',
             )
-        else:
+             else:
+         st.error("有効な計測データがまだありません。上のカメラを起動し、テストを完了させてからボタンを押してください。")
+
