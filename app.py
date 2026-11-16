@@ -1,3 +1,4 @@
+import os
 import streamlit as st
 import streamlit.components.v1 as components
 import cv2
@@ -10,7 +11,6 @@ import matplotlib.pyplot as plt
 import base64
 import tempfile
 import json
-import urllib.request
 
 st.set_page_config(page_title="眼球運動チェックアプリ", layout="centered")
 st.title("👁️ 眼球運動（追従運動）テスト")
@@ -27,10 +27,7 @@ def load_detector():
         num_faces=1
     )
     return vision.FaceLandmarker.create_from_options(options)
-        output_face_blendshapes=False,
-        output_facial_transformation_matrixes=False,
-        num_faces=1
-   
+
 detector = load_detector()
 
 def analyze_frame(frame_bgr, target_x, elapsed_time):
@@ -99,6 +96,7 @@ def show_analysis(df, calib_mean):
 
     csv = df.to_csv(index=False).encode('utf-8-sig')
     st.download_button("📥 計測データをCSVでダウンロード", data=csv, file_name='eye_result.csv', mime='text/csv')
+
 tab1, tab2 = st.tabs(["🎥 リアルタイムWebカメラテスト", "📁 録画動画でテスト"])
 
 with tab1:
