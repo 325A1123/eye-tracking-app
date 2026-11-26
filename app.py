@@ -116,12 +116,15 @@ def show_analysis(df, calib_mean):
 tab1, tab2 = st.tabs(["🎥 リアルタイムWebカメラテスト", "📁 録画動画でテスト"])
 
 with tab1:
-    st.write("1. 「テスト開始」を押してカメラを許可 → 2. 黄色い丸(3秒)→赤い丸(12秒)を目だけで追う → 3. 完了後にデータをコピーして下に貼り付け")
+    st.write("1. 「カメラを起動」を押して緑色の人型枠に顔と肩を合わせる → 2. 「テスト開始」で黄色い丸(3秒)→赤い丸(12秒)を目だけで追う → 3. 完了後にデータをコピーして下に貼り付け")
     html_code = """
     <div style="text-align:center; font-family:sans-serif;">
-        <button id="startBtn" style="padding:10px 20px; font-size:15px; background:#ff4b4b; color:white; border:none; border-radius:6px; cursor:pointer;">▶ テスト開始（カメラ起動）</button>
-        <div id="statusText" style="font-weight:bold; margin:8px 0;">ボタンを押して開始</div>
-        <div style="position:relative; width:480px; height:360px; margin:0 auto; background:#000;">
+        <div style="margin-bottom:8px;">
+            <button id="prepBtn" style="padding:10px 16px; font-size:14px; background:#2e7d32; color:white; border:none; border-radius:6px; cursor:pointer;">📷 1. カメラを起動して位置を合わせる</button>
+            <button id="startBtn" disabled style="padding:10px 16px; font-size:14px; background:#ccc; color:white; border:none; border-radius:6px; cursor:not-allowed;">▶ 2. テスト開始</button>
+        </div>
+        <div id="statusText" style="font-weight:bold; margin:8px 0;">まずは「1. カメラを起動して位置を合わせる」を押してください</div>
+        <div style="position:relative; width:480px; height:360px; margin:0 auto; background:#000; border-radius:8px; overflow:hidden;">
             <video id="video" width="480" height="360" autoplay playsinline style="transform:scaleX(-1);"></video>
             <canvas id="overlay" width="480" height="360" style="position:absolute; top:0; left:0;"></canvas>
         </div>
@@ -131,51 +134,119 @@ with tab1:
         </div>
     </div>
     <script>
-    const startBtn = document.getElementById('startBtn'), video = document.getElementById('video'), overlay = document.getElementById('overlay'), ctx = overlay.getContext('2d');
+    const prepBtn = document.getElementById('prepBtn'), startBtn = document.getElementById('startBtn');
+    const video = document.getElementById('video'), overlay = document.getElementById('overlay'), ctx = overlay.getContext('2d');
     const statusText = document.getElementById('statusText'), resultBox = document.getElementById('resultBox'), outputData = document.getElementById('outputData'), copyBtn = document.getElementById('copyBtn');
     const cap = document.createElement('canvas'); cap.width = 320; cap.height = 240; const capCtx = cap.getContext('2d');
+    let stream = null, isTesting = false, previewAnimId = null;
 
-    startBtn.onclick = async () => {
+    // 緑色の人型（顔・肩）ガイド枠を描画する関数
+    function drawGuideFrame() {
+        ctx.save();
+        ctx.strokeStyle = 'rgba(0, 255, 100, 0.75)';
+        ctx.lineWidth = 3;
+        ctx.setLineDash([8, 6]);
+
+        // 顔の輪郭（中央の楕円）
+        ctx.beginPath();
+        ctx.ellipse(240, 165, 78, 105, 0, 0, Math.PI * 2);
+        ctx.stroke();
+
+        // 肩のライン（下部のアーチ）
+        ctx.beginPath();
+        ctx.moveTo(85, 360);
+        ctx.quadraticCurveTo(100, 290, 185, 280);
+        ctx.moveTo(395, 360);
+        ctx.quadraticCurveTo(380, 290, 295, 280);
+        ctx.stroke();
+
+        // テスト開始前の案内テキスト
+        if (!isTesting) {
+            ctx.setLineDash([]);
+            ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+            ctx.fillRect(105, 18, 270, 28);
+            ctx.fillStyle = '#00ff64';
+            ctx.font = 'bold 14px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText('緑の枠に顔と肩を合わせてください', 240, 37);
+        }
+        ctx.restore();
+    }
+
+    // 待機中のプレビューループ
+    function previewLoop() {
+        if (isTesting) return;
+        ctx.clearRect(0, 0, 480, 360);
+        drawGuideFrame();
+        previewAnimId = requestAnimationFrame(previewLoop);
+    }
+
+    // 1. カメラ起動＆位置合わせ
+    prepBtn.onclick = async () => {
         try {
-            const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 480, height: 360 }, audio: false });
-            video.srcObject = stream; startBtn.disabled = true; resultBox.style.display = 'none';
-            const records = [], startTime = performance.now(); let lastCap = 0;
-            function loop(now) {
-                const elapsed = (now - startTime) / 1000.0;
-                ctx.clearRect(0, 0, 480, 360);
-                if (elapsed < 3.0) {
-                    statusText.innerText = `【基準測定】黄色い丸を見てください (${(3.0 - elapsed).toFixed(1)}秒)`;
-                    ctx.beginPath(); ctx.arc(240, 180, 14, 0, Math.PI * 2); ctx.fillStyle = 'yellow'; ctx.fill();
-                    if (now - lastCap > 150) {
-                        lastCap = now; capCtx.save(); capCtx.scale(-1, 1); capCtx.drawImage(video, -320, 0, 320, 240); capCtx.restore();
-                        records.push({ phase: 'calib', t: elapsed, tx: 160, img: cap.toDataURL('image/jpeg', 0.6) });
-                    }
-                    requestAnimationFrame(loop);
-                } else if (elapsed < 15.0) {
-                    const t = elapsed - 3.0;
-                    statusText.innerText = `【本番】赤い丸を目だけで追ってください (${(15.0 - elapsed).toFixed(1)}秒)`;
-                    const tx480 = 240 + 160 * Math.sin(2 * Math.PI * 0.12 * t);
-                    const tx320 = 160 + 106 * Math.sin(2 * Math.PI * 0.12 * t);
-                    ctx.beginPath(); ctx.arc(tx480, 180, 14, 0, Math.PI * 2); ctx.fillStyle = 'red'; ctx.fill();
-                    if (now - lastCap > 120) {
-                        lastCap = now; capCtx.save(); capCtx.scale(-1, 1); capCtx.drawImage(video, -320, 0, 320, 240); capCtx.restore();
-                        records.push({ phase: 'test', t: t, tx: tx320, img: cap.toDataURL('image/jpeg', 0.6) });
-                    }
-                    requestAnimationFrame(loop);
-                } else {
-                    stream.getTracks().forEach(tr => tr.stop());
-                    statusText.innerText = "完了！下の「計測データをコピー」を押してください。";
-                    outputData.value = JSON.stringify(records); resultBox.style.display = 'block'; startBtn.disabled = false;
+            stream = await navigator.mediaDevices.getUserMedia({ video: { width: 480, height: 360 }, audio: false });
+            video.srcObject = stream;
+            isTesting = false;
+            prepBtn.disabled = true;
+            prepBtn.style.background = '#ccc';
+            startBtn.disabled = false;
+            startBtn.style.background = '#ff4b4b';
+            startBtn.style.cursor = 'pointer';
+            statusText.innerText = "緑の枠に顔を合わせたら「2. テスト開始」を押してください";
+            previewLoop();
+        } catch (e) { statusText.innerText = "カメラエラー: " + e.message; }
+    };
+
+    // 2. テスト開始
+    startBtn.onclick = () => {
+        if (!stream) return;
+        isTesting = true;
+        cancelAnimationFrame(previewAnimId);
+        startBtn.disabled = true;
+        startBtn.style.background = '#ccc';
+        resultBox.style.display = 'none';
+
+        const records = [], startTime = performance.now(); let lastCap = 0;
+        function testLoop(now) {
+            const elapsed = (now - startTime) / 1000.0;
+            ctx.clearRect(0, 0, 480, 360);
+            drawGuideFrame();
+
+            if (elapsed < 3.0) {
+                statusText.innerText = `【基準測定】黄色い丸を見てください (${(3.0 - elapsed).toFixed(1)}秒)`;
+                ctx.beginPath(); ctx.arc(240, 180, 14, 0, Math.PI * 2); ctx.fillStyle = 'yellow'; ctx.fill();
+                if (now - lastCap > 150) {
+                    lastCap = now; capCtx.save(); capCtx.scale(-1, 1); capCtx.drawImage(video, -320, 0, 320, 240); capCtx.restore();
+                    records.push({ phase: 'calib', t: elapsed, tx: 160, img: cap.toDataURL('image/jpeg', 0.6) });
                 }
+                requestAnimationFrame(testLoop);
+            } else if (elapsed < 15.0) {
+                const t = elapsed - 3.0;
+                statusText.innerText = `【本番】赤い丸を目だけで追ってください (${(15.0 - elapsed).toFixed(1)}秒)`;
+                const tx480 = 240 + 160 * Math.sin(2 * Math.PI * 0.12 * t);
+                const tx320 = 160 + 106 * Math.sin(2 * Math.PI * 0.12 * t);
+                ctx.beginPath(); ctx.arc(tx480, 180, 14, 0, Math.PI * 2); ctx.fillStyle = 'red'; ctx.fill();
+                if (now - lastCap > 120) {
+                    lastCap = now; capCtx.save(); capCtx.scale(-1, 1); capCtx.drawImage(video, -320, 0, 320, 240); capCtx.restore();
+                    records.push({ phase: 'test', t: t, tx: tx320, img: cap.toDataURL('image/jpeg', 0.6) });
+                }
+                requestAnimationFrame(testLoop);
+            } else {
+                stream.getTracks().forEach(tr => tr.stop());
+                isTesting = false;
+                statusText.innerText = "完了！下の「計測データをコピー」を押してください。";
+                outputData.value = JSON.stringify(records);
+                resultBox.style.display = 'block';
+                prepBtn.disabled = false;
+                prepBtn.style.background = '#2e7d32';
             }
-            requestAnimationFrame(loop);
-        } catch (e) { statusText.innerText = "エラー: " + e.message; }
+        }
+        requestAnimationFrame(testLoop);
     };
     copyBtn.onclick = () => { outputData.select(); document.execCommand('copy'); copyBtn.innerText = "✅ コピー完了！"; };
     </script>
     """
-    components.html(html_code, height=500)
-
+    components.html(html_code, height=520)
     raw_json = st.text_area("📋 コピーした計測データをここに貼り付けてください", height=80)
     if st.button("📊 AIで黒目の動きを解析する", type="primary") and raw_json.strip():
         try:
@@ -208,7 +279,8 @@ with tab2:
         with st.spinner("動画を解析中..."):
             while cap.isOpened():
                 ret, frame = cap.read()
-                if not ret: break
+                if not ret:
+                    break
                 if idx % 3 == 0:
                     t = idx / fps
                     w = frame.shape[1]
