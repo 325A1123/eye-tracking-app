@@ -13,6 +13,13 @@ import base64
 import tempfile
 import json
 
+# 日本語フォント対応（インストールされていれば自動適用）
+try:
+    import japanize_matplotlib  # noqa: F401
+    USE_JP_FONT = True
+except ImportError:
+    USE_JP_FONT = False
+
 st.set_page_config(page_title="眼球運動チェックアプリ", layout="centered")
 st.title("👁️ 眼球運動（追従運動）テスト")
 
@@ -58,13 +65,26 @@ def analyze_frame(frame_bgr, target_x, elapsed_time):
     if results.face_landmarks and len(results.face_landmarks) > 0:
         lm = results.face_landmarks[0]
         nose_x = lm[1].x * w
-        face_width = abs(lm[454].x * w - lm[234].x * w)
-        left_iris_x = np.mean([lm[i].x * w for i in range(468, 473)])
-        right_iris_x = np.mean([lm[i].x * w for i in range(473, 478)])
-        if face_width > 0:
-            normalized_eye_x = (((left_iris_x + right_iris_x) / 2.0) - nose_x) / face_width
 
-    return {'Time': elapsed_time, 'Target_X': target_x, 'Norm_Eye': normalized_eye_x, 'Head_X': nose_x, 'Width': w}
+        # 右目の相対位置（目尻33 〜 目頭133 の間での虹彩468の位置）
+        r_outer, r_inner, r_iris = lm[33].x, lm[133].x, lm[468].x
+        r_ratio = (r_iris - r_outer) / (r_inner - r_outer) if abs(r_inner - r_outer) > 1e-5 else np.nan
+
+        # 左目の相対位置（目頭362 〜 目尻263 の間での虹彩473の位置）
+        l_inner, l_outer, l_iris = lm[362].x, lm[263].x, lm[473].x
+        l_ratio = (l_iris - l_inner) / (l_outer - l_inner) if abs(l_outer - l_inner) > 1e-5 else np.nan
+
+        # 両目の平均比率（0.0〜1.0の範囲）
+        if not (np.isnan(r_ratio) and np.isnan(l_ratio)):
+            normalized_eye_x = np.nanmean([r_ratio, l_ratio])
+
+    return {
+        'Time': elapsed_time,
+        'Target_X': target_x,
+        'Norm_Eye': normalized_eye_x,
+        'Head_X': nose_x,
+        'Width': w
+    }
 
 def show_analysis(df, calib_mean):
     screen_w = df['Width'].iloc[0]
@@ -75,7 +95,8 @@ def show_analysis(df, calib_mean):
     if np.isnan(calib_mean):
         calib_mean = df['Norm_Eye'].iloc[:5].mean()
 
-    df['Eye_X_Scaled_Raw'] = center_x + ((df['Norm_Eye'] - calib_mean) * (screen_w * 5.5))
+    # 目頭・目尻基準のスケールに合わせて係数を調整（3.0）
+    df['Eye_X_Scaled_Raw'] = center_x + ((df['Norm_Eye'] - calib_mean) * (screen_w * 3.0))
 
     best_shift, best_corr = 0, -1
     for s in range(0, min(20, len(df) // 3)):
@@ -87,7 +108,7 @@ def show_analysis(df, calib_mean):
 
     df['Eye_X_Scaled'] = df['Eye_X_Scaled_Raw'].shift(-best_shift).ffill().bfill()
     head_movement = df['Head_X'].std()
-    sync_score = max(0, best_corr * 100)
+    sync_score = max(0.0, best_corr * 100)
 
     st.subheader("📈 分析結果")
     c1, c2, c3 = st.columns(3)
@@ -96,39 +117,65 @@ def show_analysis(df, calib_mean):
     c3.metric("解析フレーム数", f"{len(df)} 枚")
 
     if head_movement > 15:
-        st.warning("⚠️ 顔が左右に動いています。顎を固定して目だけで追うと正確に測れます。")
+        st.warning("⚠️ 顔が左右に動いています。顎を固定して目だけで追うとより正確に計測できます。")
     if sync_score > 65:
-        st.success("✅ **診断示唆**: 的の動きに合わせて綺麗に目が動いています（正常な追従運動）。")
+        st.success("✅ **計測結果の傾向**: 的の動きに合わせてスムーズに目が追従しています。")
     else:
-        st.info("ℹ️ **診断示唆**: 連動性がやや低いです。顔を動かさず目だけで追うよう意識してください。")
+        st.info("ℹ️ **計測結果の傾向**: 連動性がやや低めです。顔を動かさず目だけで追うよう意識して再度お試しください。")
 
     fig, ax = plt.subplots(figsize=(10, 4))
-    ax.plot(df['Time'], df['Target_X'], label='Target (Red Ball)', color='red', linewidth=2)
-    ax.plot(df['Time'], df['Eye_X_Scaled'], label='Your Eye Position', color='green', linestyle='--')
+    if USE_JP_FONT:
+        ax.plot(df['Time'], df['Target_X'], label='赤い丸（ターゲット）', color='red', linewidth=2)
+        ax.plot(df['Time'], df['Eye_X_Scaled'], label='黒目の動き', color='green', linestyle='--')
+        ax.set_xlabel("経過時間 (秒)")
+        ax.set_ylabel("横方向の位置 (px)")
+    else:
+        ax.plot(df['Time'], df['Target_X'], label='Target (Red Ball)', color='red', linewidth=2)
+        ax.plot(df['Time'], df['Eye_X_Scaled'], label='Eye Position', color='green', linestyle='--')
+        ax.set_xlabel("Time (sec)")
+        ax.set_ylabel("Horizontal Position (px)")
+
     ax.set_ylim(0, screen_w)
     ax.legend()
     ax.grid(True)
     st.pyplot(fig)
+    plt.close(fig)  # メモリリーク防止
 
     csv = df.to_csv(index=False).encode('utf-8-sig')
     st.download_button("📥 計測データをCSVでダウンロード", data=csv, file_name='eye_result.csv', mime='text/csv')
 
+
 tab1, tab2 = st.tabs(["🎥 リアルタイムWebカメラテスト", "📁 録画動画でテスト"])
 
 with tab1:
-    st.write("1. 「カメラを起動」を押して緑色の人型枠に顔と肩を合わせる → 2. 「テスト開始」で黄色い丸(3秒)→赤い丸(12秒)を目だけで追う → 3. 完了後にデータをコピーして下に貼り付け")
+    st.write("1. 「カメラを起動」で緑の枠に顔と肩を合わせる → 2. 「テスト開始」で黄色い丸(3秒)→赤い丸(12秒)を目だけで追う（終了後、自動で解析が始まります）")
+
+    # JSから自動送信するための非表示入力欄（CSSで画面上から隠す）
+    st.markdown("""
+        <style>
+        div[data-testid="stTextArea"]:has(textarea[aria-label="auto_payload_bridge"]) {
+            position: fixed;
+            left: -9999px;
+            opacity: 0;
+            height: 0;
+            overflow: hidden;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
     html_code = """
-    <div style="text-align:center; font-family:sans-serif;">
-        <div style="margin-bottom:8px;">
+    <div style="text-align:center; font-family:sans-serif; width:100%;">
+        <div style="margin-bottom:8px; display:flex; gap:8px; justify-content:center; flex-wrap:wrap;">
             <button id="prepBtn" style="padding:10px 16px; font-size:14px; background:#2e7d32; color:white; border:none; border-radius:6px; cursor:pointer;">📷 1. カメラを起動して位置を合わせる</button>
             <button id="startBtn" disabled style="padding:10px 16px; font-size:14px; background:#ccc; color:white; border:none; border-radius:6px; cursor:not-allowed;">▶ 2. テスト開始</button>
         </div>
-        <div id="statusText" style="font-weight:bold; margin:8px 0;">まずは「1. カメラを起動して位置を合わせる」を押してください</div>
-        <div style="position:relative; width:480px; height:360px; margin:0 auto; background:#000; border-radius:8px; overflow:hidden;">
-            <video id="video" width="480" height="360" autoplay playsinline style="transform:scaleX(-1);"></video>
-            <canvas id="overlay" width="480" height="360" style="position:absolute; top:0; left:0;"></canvas>
+        <div id="statusText" style="font-weight:bold; margin:8px 0; font-size:14px;">まずは「1. カメラを起動して位置を合わせる」を押してください</div>
+        <div style="position:relative; width:100%; max-width:480px; aspect-ratio:4/3; margin:0 auto; background:#000; border-radius:8px; overflow:hidden;">
+            <video id="video" playsinline autoplay style="width:100%; height:100%; object-fit:cover; transform:scaleX(-1);"></video>
+            <canvas id="overlay" width="480" height="360" style="position:absolute; top:0; left:0; width:100%; height:100%;"></canvas>
         </div>
-        <div id="resultBox" style="display:none; margin-top:10px;">
+        <div id="fallbackBox" style="display:none; margin-top:10px;">
+            <p style="font-size:12px; color:#666;">自動解析が始まらない場合は下のボタンでコピーして貼り付けてください</p>
             <button id="copyBtn" style="padding:8px 16px; background:#0068c9; color:white; border:none; border-radius:4px; cursor:pointer;">📋 計測データをコピー</button>
             <textarea id="outputData" rows="2" style="width:90%; margin-top:5px;"></textarea>
         </div>
@@ -136,23 +183,21 @@ with tab1:
     <script>
     const prepBtn = document.getElementById('prepBtn'), startBtn = document.getElementById('startBtn');
     const video = document.getElementById('video'), overlay = document.getElementById('overlay'), ctx = overlay.getContext('2d');
-    const statusText = document.getElementById('statusText'), resultBox = document.getElementById('resultBox'), outputData = document.getElementById('outputData'), copyBtn = document.getElementById('copyBtn');
+    const statusText = document.getElementById('statusText'), fallbackBox = document.getElementById('fallbackBox');
+    const outputData = document.getElementById('outputData'), copyBtn = document.getElementById('copyBtn');
     const cap = document.createElement('canvas'); cap.width = 320; cap.height = 240; const capCtx = cap.getContext('2d');
     let stream = null, isTesting = false, previewAnimId = null;
 
-    // 緑色の人型（顔・肩）ガイド枠を描画する関数
     function drawGuideFrame() {
         ctx.save();
         ctx.strokeStyle = 'rgba(0, 255, 100, 0.75)';
         ctx.lineWidth = 3;
         ctx.setLineDash([8, 6]);
 
-        // 顔の輪郭（中央の楕円）
         ctx.beginPath();
         ctx.ellipse(240, 165, 78, 105, 0, 0, Math.PI * 2);
         ctx.stroke();
 
-        // 肩のライン（下部のアーチ）
         ctx.beginPath();
         ctx.moveTo(85, 360);
         ctx.quadraticCurveTo(100, 290, 185, 280);
@@ -160,7 +205,6 @@ with tab1:
         ctx.quadraticCurveTo(380, 290, 295, 280);
         ctx.stroke();
 
-        // テスト開始前の案内テキスト
         if (!isTesting) {
             ctx.setLineDash([]);
             ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
@@ -173,7 +217,6 @@ with tab1:
         ctx.restore();
     }
 
-    // 待機中のプレビューループ
     function previewLoop() {
         if (isTesting) return;
         ctx.clearRect(0, 0, 480, 360);
@@ -181,10 +224,30 @@ with tab1:
         previewAnimId = requestAnimationFrame(previewLoop);
     }
 
-    // 1. カメラ起動＆位置合わせ
+    // Streamlitの非表示テキストエリアにデータを流し込んで自動送信する関数
+    function sendToStreamlit(jsonStr) {
+        try {
+            const parentDoc = window.parent.document;
+            const targetArea = parentDoc.querySelector('textarea[aria-label="auto_payload_bridge"]');
+            if (targetArea) {
+                const nativeSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, "value").set;
+                nativeSetter.call(targetArea, jsonStr);
+                targetArea.dispatchEvent(new Event('input', { bubbles: true }));
+                targetArea.dispatchEvent(new Event('change', { bubbles: true }));
+                // Enterキー送信またはフォーカスアウトでStreamlitに値を確定させる
+                targetArea.focus();
+                targetArea.blur();
+                return true;
+            }
+        } catch (err) {
+            console.warn("Auto-bridge fallback:", err);
+        }
+        return false;
+    }
+
     prepBtn.onclick = async () => {
         try {
-            stream = await navigator.mediaDevices.getUserMedia({ video: { width: 480, height: 360 }, audio: false });
+            stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: { ideal: 480 }, height: { ideal: 360 } }, audio: false });
             video.srcObject = stream;
             isTesting = false;
             prepBtn.disabled = true;
@@ -197,14 +260,13 @@ with tab1:
         } catch (e) { statusText.innerText = "カメラエラー: " + e.message; }
     };
 
-    // 2. テスト開始
     startBtn.onclick = () => {
         if (!stream) return;
         isTesting = true;
         cancelAnimationFrame(previewAnimId);
         startBtn.disabled = true;
         startBtn.style.background = '#ccc';
-        resultBox.style.display = 'none';
+        fallbackBox.style.display = 'none';
 
         const records = [], startTime = performance.now(); let lastCap = 0;
         function testLoop(now) {
@@ -217,7 +279,7 @@ with tab1:
                 ctx.beginPath(); ctx.arc(240, 180, 14, 0, Math.PI * 2); ctx.fillStyle = 'yellow'; ctx.fill();
                 if (now - lastCap > 150) {
                     lastCap = now; capCtx.save(); capCtx.scale(-1, 1); capCtx.drawImage(video, -320, 0, 320, 240); capCtx.restore();
-                    records.push({ phase: 'calib', t: elapsed, tx: 160, img: cap.toDataURL('image/jpeg', 0.6) });
+                    records.push({ phase: 'calib', t: elapsed, tx: 160, img: cap.toDataURL('image/jpeg', 0.55) });
                 }
                 requestAnimationFrame(testLoop);
             } else if (elapsed < 15.0) {
@@ -228,31 +290,51 @@ with tab1:
                 ctx.beginPath(); ctx.arc(tx480, 180, 14, 0, Math.PI * 2); ctx.fillStyle = 'red'; ctx.fill();
                 if (now - lastCap > 120) {
                     lastCap = now; capCtx.save(); capCtx.scale(-1, 1); capCtx.drawImage(video, -320, 0, 320, 240); capCtx.restore();
-                    records.push({ phase: 'test', t: t, tx: tx320, img: cap.toDataURL('image/jpeg', 0.6) });
+                    records.push({ phase: 'test', t: t, tx: tx320, img: cap.toDataURL('image/jpeg', 0.55) });
                 }
                 requestAnimationFrame(testLoop);
             } else {
                 stream.getTracks().forEach(tr => tr.stop());
                 isTesting = false;
-                statusText.innerText = "完了！下の「計測データをコピー」を押してください。";
-                outputData.value = JSON.stringify(records);
-                resultBox.style.display = 'block';
+                const payload = JSON.stringify(records);
+                outputData.value = payload;
+
+                const sent = sendToStreamlit(payload);
+                if (sent) {
+                    statusText.innerText = "⏳ 計測完了！AIで黒目の動きを自動解析しています...";
+                } else {
+                    statusText.innerText = "完了！下の「計測データをコピー」を押してください。";
+                    fallbackBox.style.display = 'block';
+                }
                 prepBtn.disabled = false;
                 prepBtn.style.background = '#2e7d32';
             }
         }
         requestAnimationFrame(testLoop);
     };
-    copyBtn.onclick = () => { outputData.select(); document.execCommand('copy'); copyBtn.innerText = "✅ コピー完了！"; };
+
+    copyBtn.onclick = async () => {
+        try {
+            await navigator.clipboard.writeText(outputData.value);
+            copyBtn.innerText = "✅ コピー完了！";
+        } catch (e) {
+            outputData.select();
+            document.execCommand('copy');
+            copyBtn.innerText = "✅ コピー完了！";
+        }
+    };
     </script>
     """
-    components.html(html_code, height=520)
-    raw_json = st.text_area("📋 コピーした計測データをここに貼り付けてください", height=80)
-    if st.button("📊 AIで黒目の動きを解析する", type="primary") and raw_json.strip():
+    components.html(html_code, height=460)
+
+    # JSからの自動データ受け取り用ブリッジ
+    raw_json = st.text_area("auto_payload_bridge", key="auto_payload_bridge", label_visibility="collapsed")
+
+    if raw_json and raw_json.strip():
         try:
             records = json.loads(raw_json)
             calib_vals, test_logs = [], []
-            with st.spinner("MediaPipeで解析中..."):
+            with st.spinner("MediaPipeで黒目の動きを解析中..."):
                 for r in records:
                     img_bytes = base64.b64decode(r['img'].split(",", 1)[1])
                     frame = cv2.imdecode(np.frombuffer(img_bytes, np.uint8), cv2.IMREAD_COLOR)
@@ -264,30 +346,49 @@ with tab1:
             if len(test_logs) > 5:
                 show_analysis(pd.DataFrame(test_logs), np.mean(calib_vals) if calib_vals else np.nan)
             else:
-                st.error("解析データ不足です。もう一度お試しください。")
+                st.error("解析データ不足です。カメラに顔がしっかり映っているか確認してもう一度お試しください。")
         except Exception as e:
-            st.error(f"読み込みエラー: {e}")
+            st.error(f"データ解析エラー: {e}")
 
 with tab2:
-    uploaded = st.file_uploader("動画ファイル（MP4/MOV）をアップロード", type=["mp4", "mov", "avi"])
+    st.info("📌 **録画動画の前提条件**: 最初の3秒間は正面（基準点）を向き、3秒目以降から12秒間、周波数 0.12Hz で左右に動く的を目だけで追った動画をアップロードしてください。")
+    uploaded = st.file_uploader("動画ファイル（MP4/MOV/AVI）をアップロード", type=["mp4", "mov", "avi"])
     if uploaded is not None:
-        tfile = tempfile.NamedTemporaryFile(delete=False)
-        tfile.write(uploaded.read())
-        cap = cv2.VideoCapture(tfile.name)
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        logs, idx = [], 0
-        with st.spinner("動画を解析中..."):
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                if idx % 3 == 0:
-                    t = idx / fps
-                    w = frame.shape[1]
-                    logs.append(analyze_frame(frame, (w / 2.0) + (w * 0.31) * np.sin(2 * np.pi * 0.1 * t), t))
-                idx += 1
-        cap.release()
-        if len(logs) > 5:
-            show_analysis(pd.DataFrame(logs), np.nan)
-        else:
-            st.error("顔を検出できませんでした。")
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+        try:
+            tfile.write(uploaded.read())
+            tfile.close()
+            cap = cv2.VideoCapture(tfile.name)
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            duration = total_frames / fps if fps > 0 else 0
+
+            calib_vals, test_logs, idx = [], [], 0
+            has_calib_phase = duration >= 6.0  # 6秒以上の動画なら最初の3秒を基準測定とする
+
+            with st.spinner("動画を解析中..."):
+                while cap.isOpened():
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    if idx % 3 == 0:
+                        t_raw = idx / fps
+                        w = frame.shape[1]
+                        if has_calib_phase and t_raw < 3.0:
+                            res = analyze_frame(frame, w / 2.0, t_raw)
+                            if not np.isnan(res['Norm_Eye']):
+                                calib_vals.append(res['Norm_Eye'])
+                        else:
+                            t = (t_raw - 3.0) if has_calib_phase else t_raw
+                            target_x = (w / 2.0) + (w * 0.33) * np.sin(2 * np.pi * 0.12 * t)
+                            test_logs.append(analyze_frame(frame, target_x, t))
+                    idx += 1
+            cap.release()
+
+            if len(test_logs) > 5:
+                show_analysis(pd.DataFrame(test_logs), np.mean(calib_vals) if calib_vals else np.nan)
+            else:
+                st.error("顔を検出できませんでした。明るい場所で正面から撮影した動画をお試しください。")
+        finally:
+            if os.path.exists(tfile.name):
+                os.remove(tfile.name)
